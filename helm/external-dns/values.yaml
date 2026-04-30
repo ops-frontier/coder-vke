@@ -1,0 +1,27 @@
+provider:
+  name: digitalocean
+
+# Ingress のホスト名に対応する A レコードを DigitalOcean DNS に登録する
+sources:
+  - ingress
+  - service
+
+# 管理対象ドメインを限定する（DOMAIN 環境変数から設定スクリプトで置換する）
+domainFilters:
+  - "${DOMAIN}"
+
+# DigitalOcean APIトークン
+env:
+  - name: DO_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: digitalocean-token
+        key: access-token
+
+policy: upsert-only
+
+# TXT レコードでオーナーシップを記録する
+txtOwnerId: "coder-vke"
+txtPrefix: "edns-"
+
+interval: 1m

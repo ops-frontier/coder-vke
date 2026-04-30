@@ -1,0 +1,17 @@
+controller:
+  replicaCount: 2
+  # DaemonSet にして全ワーカーノードで動かし external-dns がノードのIPを検出できるようにする
+  kind: DaemonSet
+  service:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+  # SNI 不一致のリクエストをデフォルト SSL バックエンドで拒否する
+  extraArgs:
+    default-ssl-certificate: "ingress-nginx/default-tls-secret"
+  config:
+    # SNI が一致しない場合に接続を拒否する
+    ssl-reject-handshake: "true"
+  metrics:
+    enabled: false
+defaultBackend:
+  enabled: true
