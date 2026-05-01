@@ -33,7 +33,7 @@ GitHub OAuth アプリを2個登録しなければならない。
 **Callback URL** に以下を設定しなければならない。
 
 ```
-https://coder.v2v.chip-in.net/api/v2/users/oauth2/github/callback
+https://coder.poc.ops-frontier.dev/api/v2/users/oauth2/github/callback
 ```
 
 ##### ワークスペースへのログイン用
@@ -42,7 +42,7 @@ https://coder.v2v.chip-in.net/api/v2/users/oauth2/github/callback
 **Callback URL** に以下を設定しなければならない。
 
 ```
-https://auth.v2v.chip-in-v2.net/external-auth/github/callback
+https://auth.v2v.ops-frontier.net/external-auth/github/callback
 ```
 
 ### パラメータ
@@ -58,8 +58,8 @@ https://auth.v2v.chip-in-v2.net/external-auth/github/callback
 |VKE_NODE_PLAN|VKE のノードのプラン|vcpu-4-mem-8gb|vcpu-4-mem-8gb|
 |VKE_HA_CONTROL_PLANE|VKEのHAを有効にするか否か。|enabled|enabled|
 |VKE_ENABLE_FIREWALL|VKEの FireWall を有効にするか否か。|enabled|enabled|
-|DOMAIN|DigitalOcean DNS に委譲されるドメイン|v2v.chip-in.net|必須|
-|GH_ORGANIZATION|Github の組織のID |procube-open|chip-in-v2|
+|DOMAIN|DigitalOcean DNS に委譲されるドメイン|poc.ops-frontier.dev|必須|
+|GH_ORGANIZATION|Github の組織のID |procube-open|ops-frontier|
 |GH_CLIENT_ID|Coderへのログイン用 Github ClientID||必須|
 |GH_CLIENT_SECRET|Coderへのログイン用 Github Secret||必須|
 |OAUTH2_PROXY_GH_CLIENT_ID|ワークスペースへのログイン用 Github ClientID||必須|

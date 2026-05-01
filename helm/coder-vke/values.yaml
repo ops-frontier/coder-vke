@@ -6,6 +6,6 @@ destination:
   server: https://kubernetes.default.svc
 
 # グローバル設定 (deploy.sh から --set で渡す)
-domain: ""             # 必須: DigitalOcean DNS に委任されたドメイン (例: v2v.chip-in.net)
-ghOrganization: "chip-in-v2"
+domain: ""             # 必須: DigitalOcean DNS に委任されたドメイン (例: poc.ops-frontier.dev)
+ghOrganization: "ops-frontier"
 leEnvironment: "production"

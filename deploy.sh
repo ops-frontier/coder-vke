@@ -32,7 +32,7 @@ for var in "${required_vars[@]}"; do
 done
 
 # ---- デフォルト値 (Helm テンプレートで使用) ----
-GH_ORGANIZATION="${GH_ORGANIZATION:-chip-in-v2}"
+GH_ORGANIZATION="${GH_ORGANIZATION:-ops-frontier}"
 LE_ENVIRONMENT="${LE_ENVIRONMENT:-production}"
 
 # ---- Step 1: Terraform ----

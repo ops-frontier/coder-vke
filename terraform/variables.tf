@@ -48,7 +48,7 @@ variable "domain" {
 variable "gh_organization" {
   description = "GitHub organization ID"
   type        = string
-  default     = "chip-in-v2"
+  default     = "ops-frontier"
 }
 
 variable "gh_client_id" {

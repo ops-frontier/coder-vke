@@ -6,7 +6,7 @@
 #   ensure_coder_token  # CODER_SESSION_TOKEN と CODER_URL がセットされる
 #
 # 必要な環境変数 (呼び出し前にセット済みであること):
-#   DOMAIN   例: v2v.chip-in.net
+#   DOMAIN   例: poc.ops-frontier.dev
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _SECRETS_FILE="${_SCRIPT_DIR}/secrets.env"
