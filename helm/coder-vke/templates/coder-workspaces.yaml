@@ -54,6 +54,7 @@ metadata:
   namespace: coder-workspaces
   annotations:
     argocd.argoproj.io/sync-wave: "7"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   secretName: wildcard-tls
   dnsNames:
