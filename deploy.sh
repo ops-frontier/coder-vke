@@ -6,7 +6,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TERRAFORM_DIR="${SCRIPT_DIR}/terraform"
-HELM_DIR="${SCRIPT_DIR}/helm"
 KUBECONFIG_PATH="${SCRIPT_DIR}/kubeconfig"
 
 # ---- coder-auth.sh を読み込む (secrets.env の再利用・トークン自動取得) ----
@@ -37,7 +36,7 @@ GH_ORGANIZATION="${GH_ORGANIZATION:-chip-in-v2}"
 LE_ENVIRONMENT="${LE_ENVIRONMENT:-production}"
 
 # ---- Step 1: Terraform ----
-echo "==> [1/7] Terraform: VKE & PostgreSQL & Container Registry をプロビジョニング..."
+echo "==> [1/5] Terraform: VKE & PostgreSQL & Container Registry をプロビジョニング..."
 cd "${TERRAFORM_DIR}"
 terraform init -input=false
 
@@ -61,198 +60,178 @@ VCR_REGION="${VULTR_REGION:-nrt}"
 
 cd "${SCRIPT_DIR}"
 
-# ---- Step 2: ingress-nginx ----
-echo "==> [2/7] Helm: ingress-nginx をデプロイ..."
-kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-helm repo update
-helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-  --namespace ingress-nginx \
-  --values "${HELM_DIR}/ingress-nginx/values.yaml" \
+# ---- Step 2: ArgoCD ----
+echo "==> [2/5] Helm: ArgoCD をインストール..."
+kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update argo
+helm upgrade --install argocd argo/argo-cd \
+  --namespace argocd \
+  --set server.service.type=ClusterIP \
   --wait
 
-# ---- Step 3: cert-manager ----
-echo "==> [3/7] Helm: cert-manager をデプロイ..."
-kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
-helm repo add jetstack https://charts.jetstack.io
-helm repo update
-helm upgrade --install cert-manager jetstack/cert-manager \
+# ---- Step 3: K8s ネームスペースとシークレットを作成 ----
+echo "==> [3/5] K8s ネームスペースとシークレットを作成..."
+
+# ネームスペースの作成
+for ns in cert-manager external-dns oauth2-proxy coder coder-workspaces; do
+  kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f -
+done
+
+# cert-manager: DigitalOcean API トークン
+kubectl create secret generic digitalocean-token \
   --namespace cert-manager \
-  --values "${HELM_DIR}/cert-manager/values.yaml" \
-  --wait
+  --from-literal=access-token="${DO_PAT}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# DigitalOcean Secret と ClusterIssuer を適用
-DO_SECRET_FILE=$(mktemp)
-sed "s|\${DO_PAT}|${DO_PAT}|g" \
-  "${HELM_DIR}/cert-manager/templates/do-secret.yaml" > "${DO_SECRET_FILE}"
-kubectl apply -f "${DO_SECRET_FILE}"
-rm -f "${DO_SECRET_FILE}"
-
-ISSUER_FILE=$(mktemp)
-sed "s|\${DOMAIN}|${DOMAIN}|g; s|\${LE_ENVIRONMENT}|${LE_ENVIRONMENT}|g" \
-  "${HELM_DIR}/cert-manager/templates/cluster-issuer.yaml" > "${ISSUER_FILE}"
-kubectl apply -f "${ISSUER_FILE}"
-rm -f "${ISSUER_FILE}"
-
-# ---- Step 4: external-dns ----
-echo "==> [4/7] Helm: external-dns をデプロイ..."
-kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
-
-DNS_SECRET_FILE=$(mktemp)
-sed "s|\${DO_PAT}|${DO_PAT}|g" \
-  "${HELM_DIR}/external-dns/templates/do-secret.yaml" > "${DNS_SECRET_FILE}"
-kubectl apply -f "${DNS_SECRET_FILE}"
-rm -f "${DNS_SECRET_FILE}"
-
-helm repo add external-dns-official https://kubernetes-sigs.github.io/external-dns/
-helm repo update external-dns-official
-VALUES_FILE=$(mktemp)
-sed "s|\${DOMAIN}|${DOMAIN}|g" \
-  "${HELM_DIR}/external-dns/values.yaml" > "${VALUES_FILE}"
-helm upgrade --install external-dns external-dns-official/external-dns \
+# external-dns: DigitalOcean API トークン
+kubectl create secret generic digitalocean-token \
   --namespace external-dns \
-  --version 1.14.5 \
-  --values "${VALUES_FILE}" \
-  --wait
-rm -f "${VALUES_FILE}"
+  --from-literal=access-token="${DO_PAT}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# ---- Step 5: oauth2-proxy ----
-echo "==> [5/7] Helm: oauth2-proxy をデプロイ..."
-kubectl create namespace oauth2-proxy --dry-run=client -o yaml | kubectl apply -f -
-
-# Cookie シークレット: secrets.env → K8s Secret → 新規生成 の順で取得し secrets.env に保存
-  if [[ -z "${OAUTH2_PROXY_COOKIE_SECRET:-}" ]]; then
-    if kubectl get secret oauth2-proxy-credentials -n oauth2-proxy >/dev/null 2>&1; then
-      OAUTH2_PROXY_COOKIE_SECRET=$(kubectl get secret oauth2-proxy-credentials \
-        -n oauth2-proxy -o jsonpath='{.data.cookie-secret}' | base64 -d)
-    else
-      OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -hex 16)
-    fi
-    _save_secret "OAUTH2_PROXY_COOKIE_SECRET" "${OAUTH2_PROXY_COOKIE_SECRET}"
+# oauth2-proxy: Cookie シークレット (secrets.env → K8s Secret → 新規生成 の順で取得)
+if [[ -z "${OAUTH2_PROXY_COOKIE_SECRET:-}" ]]; then
+  if kubectl get secret oauth2-proxy-credentials -n oauth2-proxy >/dev/null 2>&1; then
+    OAUTH2_PROXY_COOKIE_SECRET=$(kubectl get secret oauth2-proxy-credentials \
+      -n oauth2-proxy -o jsonpath='{.data.cookie-secret}' | base64 -d)
+  else
+    OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -hex 16)
+  fi
+  _save_secret "OAUTH2_PROXY_COOKIE_SECRET" "${OAUTH2_PROXY_COOKIE_SECRET}"
 fi
-
-OP_SECRET_FILE=$(mktemp)
-sed "s|\${OAUTH2_PROXY_GH_CLIENT_ID}|${OAUTH2_PROXY_GH_CLIENT_ID}|g; \
-     s|\${OAUTH2_PROXY_GH_CLIENT_SECRET}|${OAUTH2_PROXY_GH_CLIENT_SECRET}|g; \
-     s|\${OAUTH2_PROXY_COOKIE_SECRET}|${OAUTH2_PROXY_COOKIE_SECRET}|g" \
-  "${HELM_DIR}/oauth2-proxy/templates/secret.yaml" > "${OP_SECRET_FILE}"
-kubectl apply -f "${OP_SECRET_FILE}"
-rm -f "${OP_SECRET_FILE}"
-
-helm repo add oauth2-proxy https://oauth2-proxy.github.io/manifests 2>/dev/null || true
-helm repo update oauth2-proxy
-OP_VALUES_FILE=$(mktemp)
-sed "s|\${GH_ORGANIZATION}|${GH_ORGANIZATION}|g; \
-     s|\${DOMAIN}|${DOMAIN}|g; \
-     s|\${LE_ENVIRONMENT}|${LE_ENVIRONMENT}|g" \
-  "${HELM_DIR}/oauth2-proxy/values.yaml" > "${OP_VALUES_FILE}"
-helm upgrade --install oauth2-proxy oauth2-proxy/oauth2-proxy \
+kubectl create secret generic oauth2-proxy-credentials \
   --namespace oauth2-proxy \
-  --values "${OP_VALUES_FILE}" \
-  --wait
-rm -f "${OP_VALUES_FILE}"
+  --from-literal=client-id="${OAUTH2_PROXY_GH_CLIENT_ID}" \
+  --from-literal=client-secret="${OAUTH2_PROXY_GH_CLIENT_SECRET}" \
+  --from-literal=cookie-secret="${OAUTH2_PROXY_COOKIE_SECRET}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# ---- Step 6: Coder ----
-echo "==> [6/7] Helm: Coder をデプロイ..."
-kubectl create namespace coder --dry-run=client -o yaml | kubectl apply -f -
-
-# DB URL Secret
+# coder: DB URL
 kubectl create secret generic coder-db-url \
   --namespace coder \
   --from-literal=url="${DB_URL}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# GitHub OAuth Secret (Coder ログイン用)
-GH_SECRET_FILE=$(mktemp)
-sed "s|\${GH_CLIENT_ID}|${GH_CLIENT_ID}|g; s|\${GH_CLIENT_SECRET}|${GH_CLIENT_SECRET}|g" \
-  "${HELM_DIR}/coder/templates/github-oauth-secret.yaml" > "${GH_SECRET_FILE}"
-kubectl apply -f "${GH_SECRET_FILE}"
-rm -f "${GH_SECRET_FILE}"
-
-# GitHub External Auth Secret (テンプレート git clone 用・別 OAuth App)
-GH_EXT_SECRET_FILE=$(mktemp)
-sed "s|\${GH_EXT_CLIENT_ID}|${GH_EXT_CLIENT_ID}|g; s|\${GH_EXT_CLIENT_SECRET}|${GH_EXT_CLIENT_SECRET}|g" \
-  "${HELM_DIR}/coder/templates/github-ext-auth-secret.yaml" > "${GH_EXT_SECRET_FILE}"
-kubectl apply -f "${GH_EXT_SECRET_FILE}"
-rm -f "${GH_EXT_SECRET_FILE}"
-
-helm repo add coder https://helm.coder.com/v2
-helm repo update
-CODER_VALUES_FILE=$(mktemp)
-sed "s|\${DOMAIN}|${DOMAIN}|g; \
-     s|\${GH_ORGANIZATION}|${GH_ORGANIZATION}|g; \
-     s|\${LE_ENVIRONMENT}|${LE_ENVIRONMENT}|g" \
-  "${HELM_DIR}/coder/values.yaml" > "${CODER_VALUES_FILE}"
-helm upgrade --install coder coder/coder \
+# coder: GitHub OAuth (ログイン用)
+kubectl create secret generic coder-github-oauth \
   --namespace coder \
-  --values "${CODER_VALUES_FILE}" \
-  --wait
-rm -f "${CODER_VALUES_FILE}"
+  --from-literal=client-id="${GH_CLIENT_ID}" \
+  --from-literal=client-secret="${GH_CLIENT_SECRET}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# coder-workspaces namespace と RBAC の作成
-kubectl create namespace coder-workspaces --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f - <<'RBAC_EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: coder-workspace-manager
-  namespace: coder-workspaces
-rules:
-  - apiGroups: ["", "apps", "networking.k8s.io"]
-    resources:
-      - pods
-      - deployments
-      - replicasets
-      - services
-      - ingresses
-      - persistentvolumeclaims
-      - secrets
-      - configmaps
-    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
-RBAC_EOF
-kubectl apply -f - <<'RBAC_EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: coder-workspace-manager
-  namespace: coder-workspaces
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: coder-workspace-manager
-subjects:
-  - kind: ServiceAccount
-    name: coder
-    namespace: coder
-RBAC_EOF
+# coder: GitHub External Auth (テンプレート git clone 用・別 OAuth App)
+kubectl create secret generic coder-github-external-auth \
+  --namespace coder \
+  --from-literal=client-id="${GH_EXT_CLIENT_ID}" \
+  --from-literal=client-secret="${GH_EXT_CLIENT_SECRET}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# ワイルドカード TLS 証明書を coder-workspaces namespace に作成 (全ワークスペースで共有)
-# ワークスペースごとの個別発行を避け Let's Encrypt レート制限を防ぐ
+# ---- Step 4: ArgoCD Application (coder-vke) をデプロイ ----
+echo "==> [4/5] ArgoCD: coder-vke チャートをデプロイ..."
+
+# Git リモート URL を取得 (SSH → HTTPS に変換)
+REPO_URL=$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || echo "")
+if [[ -z "${REPO_URL}" ]]; then
+  echo "ERROR: Git リモート URL を取得できませんでした。" >&2
+  exit 1
+fi
+REPO_URL=$(echo "${REPO_URL}" | sed 's|git@github\.com:|https://github.com/|')
+
 kubectl apply -f - <<EOF
-apiVersion: cert-manager.io/v1
-kind: Certificate
+apiVersion: argoproj.io/v1alpha1
+kind: Application
 metadata:
-  name: wildcard-tls
-  namespace: coder-workspaces
+  name: coder-vke
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
-  secretName: wildcard-tls
-  dnsNames:
-    - "*.${DOMAIN}"
-  issuerRef:
-    name: letsencrypt-${LE_ENVIRONMENT}
-    kind: ClusterIssuer
-    group: cert-manager.io
+  project: default
+  source:
+    repoURL: ${REPO_URL}
+    targetRevision: HEAD
+    path: helm/coder-vke
+    helm:
+      parameters:
+        - name: domain
+          value: "${DOMAIN}"
+        - name: ghOrganization
+          value: "${GH_ORGANIZATION}"
+        - name: leEnvironment
+          value: "${LE_ENVIRONMENT}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
 EOF
 
-# wildcard-tls 証明書が発行されるまで待機 (ワークスペース作成前に secret が存在することを保証)
-echo "    wildcard-tls 証明書の発行を待機中 (最大5分)..."
-kubectl wait certificate wildcard-tls -n coder-workspaces \
-  --for=condition=Ready \
-  --timeout=300s
-echo "    wildcard-tls 証明書の発行完了"
+echo "    ArgoCD Application 'coder-vke' を作成しました"
+echo "    ArgoCD UI: kubectl port-forward svc/argocd-server -n argocd 8080:443"
 
-# ---- Step 7: ワークスペースイメージのビルド & Coder テンプレートのプッシュ ----
-echo "==> [7/7] ワークスペースイメージをビルドして Coder テンプレートをプッシュ..."
+# ---- ArgoCD 同期完了 & DNS 解決待ち ----
+echo "==> ArgoCD の同期完了を待機中..."
+
+# ArgoCD CLI がなければ kubectl で Application の Health/Sync 状態をポーリングする
+_wait_argocd_synced() {
+  local app="$1" timeout_sec="${2:-600}" interval=15 elapsed=0
+  while (( elapsed < timeout_sec )); do
+    local sync health
+    sync=$(kubectl get application "${app}" -n argocd \
+      -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+    health=$(kubectl get application "${app}" -n argocd \
+      -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+    echo "    [ArgoCD] ${app}: sync=${sync} health=${health}"
+    if [[ "${sync}" == "Synced" && "${health}" == "Healthy" ]]; then
+      echo "    ArgoCD Application '${app}' が Synced/Healthy になりました"
+      return 0
+    fi
+    sleep "${interval}"
+    (( elapsed += interval ))
+  done
+  echo "WARNING: ArgoCD Application '${app}' がタイムアウト前に Synced/Healthy になりませんでした。" >&2
+  return 1
+}
+
+_wait_argocd_synced coder-vke 600 || true
+
+# ingress-nginx LoadBalancer の外部 IP が付与されるまで待機
+echo "==> ingress-nginx の LoadBalancer IP を待機中..."
+LB_IP=""
+for i in $(seq 1 40); do
+  LB_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+  if [[ -n "${LB_IP}" ]]; then
+    echo "    LoadBalancer IP: ${LB_IP}"
+    break
+  fi
+  printf "."
+  sleep 15
+done
+echo ""
+if [[ -z "${LB_IP}" ]]; then
+  echo "WARNING: ingress-nginx の LoadBalancer IP が取得できませんでした。DNS 登録を確認してください。" >&2
+fi
+
+# coder.${DOMAIN} の DNS 解決が成功するまで待機 (最大 10 分)
+echo "==> coder.${DOMAIN} の DNS 解決を待機中..."
+for i in $(seq 1 40); do
+  if host "coder.${DOMAIN}" >/dev/null 2>&1; then
+    echo "    DNS 解決成功: coder.${DOMAIN}"
+    break
+  fi
+  printf "."
+  sleep 15
+done
+echo ""
+
+# ---- Step 5: ワークスペースイメージのビルド & Coder テンプレートのプッシュ ----
+echo "==> [5/5] ワークスペースイメージをビルドして Coder テンプレートをプッシュ..."
 
 # Vultr Container Registry docker-credentials を取得してログイン
 VCR_CREDS=$(curl -s \
@@ -321,6 +300,10 @@ echo ""
 echo "==> デプロイ完了!"
 echo "    Coder URL   : https://coder.${DOMAIN}"
 echo "    OAuth2 Proxy: https://auth.${DOMAIN}/oauth2"
+echo ""
+echo "    ArgoCD UI にアクセスする場合:"
+echo "      kubectl port-forward svc/argocd-server -n argocd 8080:443"
+echo "      ブラウザで https://localhost:8080 にアクセス"
 echo ""
 echo "NOTE: GitHub OAuth アプリの Callback URL に以下を追加してください:"
 echo "      https://auth.${DOMAIN}/oauth2/callback"

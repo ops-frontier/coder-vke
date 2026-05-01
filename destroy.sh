@@ -91,37 +91,30 @@ else
   echo -e "    ${YELLOW}Vultr コントロールパネルで Block Storage を確認・手動削除してください。${NC}"
 fi
 
-# ---- Step 3: Helm リリースを削除 ----
-# Ingress 等が先に消えると external-dns が DNS レコードを削除できなくなるため
-# external-dns を最後に削除する
-echo "==> [3/7] Helm リリースを削除..."
+# ---- Step 3: ArgoCD でチャートをアンインストール ----
+echo "==> [3/7] ArgoCD: coder-vke チャートをアンインストール..."
 if [[ -f "${KUBECONFIG_PATH}" ]]; then
-  delete_helm() {
-    local release=$1 namespace=$2
-    if helm status "${release}" -n "${namespace}" >/dev/null 2>&1; then
-      echo "    helm uninstall ${release} -n ${namespace}"
-      helm uninstall "${release}" -n "${namespace}" --timeout 120s 2>/dev/null || true
-    fi
-  }
+  if kubectl get application coder-vke -n argocd >/dev/null 2>&1; then
+    echo "    ArgoCD Application 'coder-vke' を削除します..."
+    # cascade delete: ArgoCD が管理するすべてのリソースを削除する
+    kubectl delete application coder-vke -n argocd --timeout=300s 2>/dev/null || true
+    echo "    coder-vke Application 削除完了"
 
-  # Coder 系 (Ingress を持つ) を先に削除して DNS レコード削除をトリガー
-  delete_helm coder          coder
-  delete_helm oauth2-proxy   oauth2-proxy
+    # external-dns が DNS レコードを削除するのを待つ
+    echo "    external-dns が DNS レコードを削除するのを待っています (30秒)..."
+    sleep 30
+  else
+    echo "    ArgoCD Application 'coder-vke' が見つかりません。スキップします。"
+  fi
 
-  # DNS レコードが削除されるまで少し待つ
-  echo "    external-dns が DNS レコードを削除するのを待っています (30秒)..."
-  sleep 30
-
-  # external-dns を削除
-  delete_helm external-dns   external-dns
-
-  # その他
-  delete_helm cert-manager   cert-manager
-  delete_helm ingress-nginx  ingress-nginx
-
-  echo "    Helm リリース削除完了"
+  # ArgoCD 自体をアンインストール
+  if helm status argocd -n argocd >/dev/null 2>&1; then
+    echo "    ArgoCD をアンインストール..."
+    helm uninstall argocd -n argocd --timeout 120s 2>/dev/null || true
+    echo "    ArgoCD アンインストール完了"
+  fi
 else
-  echo -e "    ${YELLOW}kubeconfig が見つかりません。Helm 削除をスキップします。${NC}"
+  echo -e "    ${YELLOW}kubeconfig が見つかりません。ArgoCD 削除をスキップします。${NC}"
 fi
 
 # ---- Step 4: DigitalOcean DNS の A/TXT レコードを削除 ----

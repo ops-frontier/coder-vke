@@ -1,7 +1,0 @@
-installCRDs: true
-
-global:
-  leaderElection:
-    namespace: cert-manager
-
-# Let's Encrypt の本番/ステージング切り替えは ClusterIssuer マニフェストで行う

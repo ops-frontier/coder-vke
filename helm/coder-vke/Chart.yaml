@@ -1,0 +1,5 @@
+apiVersion: v2
+name: coder-vke
+description: Coder on VKE - ArgoCD App of Apps チャート
+type: application
+version: 0.1.0

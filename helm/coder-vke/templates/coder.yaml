@@ -1,0 +1,89 @@
+{{- if .Values.domain }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: coder
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://helm.coder.com/v2
+    chart: coder
+    targetRevision: "^2.0.0"
+    helm:
+      values: |
+        coder:
+          env:
+            - name: CODER_PG_CONNECTION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: coder-db-url
+                  key: url
+            - name: CODER_ACCESS_URL
+              value: "https://coder.{{ .Values.domain }}"
+            - name: CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS
+              value: "true"
+            - name: CODER_OAUTH2_GITHUB_ALLOWED_ORGS
+              value: "{{ .Values.ghOrganization }}"
+            - name: CODER_OAUTH2_GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: coder-github-oauth
+                  key: client-id
+            - name: CODER_OAUTH2_GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: coder-github-oauth
+                  key: client-secret
+            - name: CODER_EXTERNAL_AUTH_0_ID
+              value: "github"
+            - name: CODER_EXTERNAL_AUTH_0_TYPE
+              value: "github"
+            - name: CODER_EXTERNAL_AUTH_0_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: coder-github-external-auth
+                  key: client-id
+            - name: CODER_EXTERNAL_AUTH_0_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: coder-github-external-auth
+                  key: client-secret
+            - name: CODER_EXTERNAL_AUTH_0_SCOPES
+              value: "read:user,user:email,repo"
+            - name: CODER_EXTERNAL_AUTH_0_DISPLAY_NAME
+              value: "GitHub"
+          ingress:
+            enable: true
+            className: "nginx"
+            host: "coder.{{ .Values.domain }}"
+            wildcardHost: "*.coder.{{ .Values.domain }}"
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-{{ .Values.leEnvironment }}"
+            tls:
+              enable: true
+              secretName: coder-tls-secret
+            wildcardTLS:
+              enable: true
+              secretName: coder-wildcard-tls-secret
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+  destination:
+    server: {{ .Values.destination.server }}
+    namespace: coder
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+{{- end }}
