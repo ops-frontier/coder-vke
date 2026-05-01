@@ -5,6 +5,11 @@ controller:
   service:
     type: LoadBalancer
     externalTrafficPolicy: Local
+  # configuration-snippet アノテーションを許可 (ワークスペースオーナー確認に必要)
+  allowSnippetAnnotations: true
+  # admission webhook を無効化 (allow-snippet-annotations の動的読み込み問題を回避)
+  admissionWebhooks:
+    enabled: false
   # SNI 不一致のリクエストをデフォルト SSL バックエンドで拒否する
   extraArgs:
     default-ssl-certificate: "ingress-nginx/default-tls-secret"

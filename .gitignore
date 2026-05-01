@@ -9,6 +9,9 @@ terraform/*.tfvars.json
 # kubeconfig (機密情報)
 kubeconfig
 
+# 自動生成されるシークレット (パスワード・トークン)
+secrets.env
+
 # Docker ビルドキャッシュ
 docker/workspace/.dockerignore
 
@@ -20,3 +23,5 @@ Thumbs.db
 .vscode/settings.json
 *.swp
 *.swo
+
+/tmp

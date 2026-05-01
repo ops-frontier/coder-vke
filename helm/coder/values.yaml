@@ -35,12 +35,12 @@ coder:
     - name: CODER_EXTERNAL_AUTH_0_CLIENT_ID
       valueFrom:
         secretKeyRef:
-          name: coder-github-oauth
+          name: coder-github-external-auth
           key: client-id
     - name: CODER_EXTERNAL_AUTH_0_CLIENT_SECRET
       valueFrom:
         secretKeyRef:
-          name: coder-github-oauth
+          name: coder-github-external-auth
           key: client-secret
     - name: CODER_EXTERNAL_AUTH_0_SCOPES
       value: "read:user,user:email,repo"

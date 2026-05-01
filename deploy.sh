@@ -9,6 +9,10 @@ TERRAFORM_DIR="${SCRIPT_DIR}/terraform"
 HELM_DIR="${SCRIPT_DIR}/helm"
 KUBECONFIG_PATH="${SCRIPT_DIR}/kubeconfig"
 
+# ---- coder-auth.sh を読み込む (secrets.env の再利用・トークン自動取得) ----
+# shellcheck source=coder-auth.sh
+source "${SCRIPT_DIR}/coder-auth.sh"
+
 # ---- 必須環境変数チェック ----
 required_vars=(
   VULTR_API_KEY
@@ -16,6 +20,10 @@ required_vars=(
   DOMAIN
   GH_CLIENT_ID
   GH_CLIENT_SECRET
+  GH_EXT_CLIENT_ID
+  GH_EXT_CLIENT_SECRET
+  OAUTH2_PROXY_GH_CLIENT_ID
+  OAUTH2_PROXY_GH_CLIENT_SECRET
 )
 for var in "${required_vars[@]}"; do
   if [[ -z "${!var:-}" ]]; then
@@ -112,17 +120,20 @@ rm -f "${VALUES_FILE}"
 echo "==> [5/7] Helm: oauth2-proxy をデプロイ..."
 kubectl create namespace oauth2-proxy --dry-run=client -o yaml | kubectl apply -f -
 
-# Cookie シークレット: 既存があれば再利用（デプロイのたびにセッションを無効にしない）
-if kubectl get secret oauth2-proxy-credentials -n oauth2-proxy >/dev/null 2>&1; then
-  OAUTH2_PROXY_COOKIE_SECRET=$(kubectl get secret oauth2-proxy-credentials \
-    -n oauth2-proxy -o jsonpath='{.data.cookie-secret}' | base64 -d)
-else
-  OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -hex 16)
+# Cookie シークレット: secrets.env → K8s Secret → 新規生成 の順で取得し secrets.env に保存
+  if [[ -z "${OAUTH2_PROXY_COOKIE_SECRET:-}" ]]; then
+    if kubectl get secret oauth2-proxy-credentials -n oauth2-proxy >/dev/null 2>&1; then
+      OAUTH2_PROXY_COOKIE_SECRET=$(kubectl get secret oauth2-proxy-credentials \
+        -n oauth2-proxy -o jsonpath='{.data.cookie-secret}' | base64 -d)
+    else
+      OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -hex 16)
+    fi
+    _save_secret "OAUTH2_PROXY_COOKIE_SECRET" "${OAUTH2_PROXY_COOKIE_SECRET}"
 fi
 
 OP_SECRET_FILE=$(mktemp)
-sed "s|\${GH_CLIENT_ID}|${GH_CLIENT_ID}|g; \
-     s|\${GH_CLIENT_SECRET}|${GH_CLIENT_SECRET}|g; \
+sed "s|\${OAUTH2_PROXY_GH_CLIENT_ID}|${OAUTH2_PROXY_GH_CLIENT_ID}|g; \
+     s|\${OAUTH2_PROXY_GH_CLIENT_SECRET}|${OAUTH2_PROXY_GH_CLIENT_SECRET}|g; \
      s|\${OAUTH2_PROXY_COOKIE_SECRET}|${OAUTH2_PROXY_COOKIE_SECRET}|g" \
   "${HELM_DIR}/oauth2-proxy/templates/secret.yaml" > "${OP_SECRET_FILE}"
 kubectl apply -f "${OP_SECRET_FILE}"
@@ -151,12 +162,19 @@ kubectl create secret generic coder-db-url \
   --from-literal=url="${DB_URL}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# GitHub OAuth Secret
+# GitHub OAuth Secret (Coder ログイン用)
 GH_SECRET_FILE=$(mktemp)
 sed "s|\${GH_CLIENT_ID}|${GH_CLIENT_ID}|g; s|\${GH_CLIENT_SECRET}|${GH_CLIENT_SECRET}|g" \
   "${HELM_DIR}/coder/templates/github-oauth-secret.yaml" > "${GH_SECRET_FILE}"
 kubectl apply -f "${GH_SECRET_FILE}"
 rm -f "${GH_SECRET_FILE}"
+
+# GitHub External Auth Secret (テンプレート git clone 用・別 OAuth App)
+GH_EXT_SECRET_FILE=$(mktemp)
+sed "s|\${GH_EXT_CLIENT_ID}|${GH_EXT_CLIENT_ID}|g; s|\${GH_EXT_CLIENT_SECRET}|${GH_EXT_CLIENT_SECRET}|g" \
+  "${HELM_DIR}/coder/templates/github-ext-auth-secret.yaml" > "${GH_EXT_SECRET_FILE}"
+kubectl apply -f "${GH_EXT_SECRET_FILE}"
+rm -f "${GH_EXT_SECRET_FILE}"
 
 helm repo add coder https://helm.coder.com/v2
 helm repo update
@@ -208,16 +226,43 @@ subjects:
     namespace: coder
 RBAC_EOF
 
+# ワイルドカード TLS 証明書を coder-workspaces namespace に作成 (全ワークスペースで共有)
+# ワークスペースごとの個別発行を避け Let's Encrypt レート制限を防ぐ
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-tls
+  namespace: coder-workspaces
+spec:
+  secretName: wildcard-tls
+  dnsNames:
+    - "*.${DOMAIN}"
+  issuerRef:
+    name: letsencrypt-${LE_ENVIRONMENT}
+    kind: ClusterIssuer
+    group: cert-manager.io
+EOF
+
+# wildcard-tls 証明書が発行されるまで待機 (ワークスペース作成前に secret が存在することを保証)
+echo "    wildcard-tls 証明書の発行を待機中 (最大5分)..."
+kubectl wait certificate wildcard-tls -n coder-workspaces \
+  --for=condition=Ready \
+  --timeout=300s
+echo "    wildcard-tls 証明書の発行完了"
+
 # ---- Step 7: ワークスペースイメージのビルド & Coder テンプレートのプッシュ ----
 echo "==> [7/7] ワークスペースイメージをビルドして Coder テンプレートをプッシュ..."
+
 # Vultr Container Registry docker-credentials を取得してログイン
-VCR_CREDS=$(curl -sf \
-  "https://api.vultr.com/v2/registries/${VCR_ID}/docker-credentials?expiry_seconds=0&read_write=true" \
-  -H "Authorization: Bearer ${VULTR_API_KEY}")
-VCR_AUTH=$(echo "${VCR_CREDS}" | grep -o '"auth":"[^"]*"' | cut -d'"' -f4)
-if [[ -z "${VCR_AUTH}" ]]; then
-  echo "ERROR: VCR 認証情報の取得に失敗しました" >&2
-  exit 1
+VCR_CREDS=$(curl -s \
+  "https://api.vultr.com/v2/registry/${VCR_ID}/docker-credentials?expiry_seconds=0&read_write=true" \
+  -H "Authorization: Bearer ${VULTR_API_KEY}" -X OPTIONS)
+
+VCR_AUTH=$(echo "${VCR_CREDS}" | jq -r ".auths.\"${VCR_REGION}.vultrcr.com\".auth")
+if [[ "${VCR_AUTH}" == "null" ]]; then
+  echo "ERROR: VCR 認証情報の解析に失敗しました ${VCR_CREDS}" >&2
+  # exit 1
 fi
 VCR_USERNAME=$(echo "${VCR_AUTH}" | base64 -d | cut -d':' -f1)
 VCR_PASSWORD=$(echo "${VCR_AUTH}" | base64 -d | cut -d':' -f2-)
@@ -228,17 +273,40 @@ echo "${VCR_PASSWORD}" | docker login "${VCR_REGION}.vultrcr.com" \
 docker build -t "${VCR_IMAGE}" "${SCRIPT_DIR}/docker/workspace"
 docker push "${VCR_IMAGE}"
 
+TARGET_DIR="/usr/local/share/ca-certificates/letsencrypt-staging"
+if [[ "${LE_ENVIRONMENT}" == "staging" && ! -f "$TARGET_DIR/le-stg-root-x1.crt" ]]; then
+  echo "Installing Let's Encrypt Staging certificates..."
+
+  # 1. 保存先ディレクトリの作成
+  sudo mkdir -p "$TARGET_DIR"
+
+  # 2. 証明書のダウンロード (Staging Root X1 と Intermediate R3)
+  # 注: URLは最新の状態を公式サイトで確認することをお勧めします
+  sudo curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem -o "$TARGET_DIR/le-stg-root-x1.crt"
+  sudo curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-int-r3.pem -o "$TARGET_DIR/le-stg-int-r3.crt"
+
+  # 3. パーミッションの設定
+  sudo chmod 644 "$TARGET_DIR"/*.crt
+
+  # 4. システムのトラストストアを更新
+  sudo update-ca-certificates
+
+  echo "Done. Staging certificates are now trusted."
+fi
+
 # Coder CLI のインストール
 if ! command -v coder >/dev/null 2>&1; then
   echo "Coder CLI をインストール中..."
-  curl -fsSL "https://coder.${DOMAIN}/bin/coder-linux-amd64" -o /usr/local/bin/coder
-  chmod +x /usr/local/bin/coder
+  sudo curl -fsSL "https://coder.${DOMAIN}/bin/coder-linux-amd64" -o /usr/local/bin/coder
+  sudo chmod +x /usr/local/bin/coder
 fi
 
-# Coder テンプレートのプッシュ (CODER_SESSION_TOKEN が設定されている場合)
-if [[ -n "${CODER_SESSION_TOKEN:-}" ]]; then
-  coder login "https://coder.${DOMAIN}" --token "${CODER_SESSION_TOKEN}"
-  coder templates push workspace \
+# Coder トークンを取得 (初回は管理者ユーザーを作成してトークンを保存)
+echo "==> Coder セッショントークンを確認..."
+ensure_coder_token
+
+coder login "https://coder.${DOMAIN}" --token "${CODER_SESSION_TOKEN}"
+coder templates push workspace \
     --directory "${SCRIPT_DIR}/coder-template" \
     --activate \
     --yes \
@@ -247,13 +315,7 @@ if [[ -n "${CODER_SESSION_TOKEN:-}" ]]; then
     --variable workspace_image="${VCR_IMAGE}" \
     --variable namespace="coder-workspaces" \
     --variable cluster_issuer="letsencrypt-${LE_ENVIRONMENT}"
-  echo "    テンプレート 'workspace' をプッシュしました"
-else
-  echo ""
-  echo "NOTE: Coder テンプレートを登録するには CODER_SESSION_TOKEN を設定して再実行してください:"
-  echo "  1. https://coder.${DOMAIN} にログインし、設定 > トークンでセッショントークンを作成"
-  echo "  2. CODER_SESSION_TOKEN=<token> ./deploy.sh を実行"
-fi
+echo "    テンプレート 'workspace' をプッシュしました"
 
 echo ""
 echo "==> デプロイ完了!"

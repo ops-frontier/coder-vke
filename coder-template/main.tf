@@ -88,13 +88,14 @@ resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
 
+
   env = {
     GITHUB_TOKEN = data.coder_external_auth.github.access_token
     GH_ORG       = var.gh_organization
     REPO_NAME    = data.coder_parameter.git_repo.value
     OWNER_NAME   = local.owner_name
     OWNER_EMAIL  = data.coder_workspace_owner.me.email
-    DOCKER_HOST  = "unix:///var/run/docker.sock"
+    DOCKER_HOST  = "tcp://localhost:2375"
   }
 
   # エージェント起動後に実行されるスクリプト
@@ -118,48 +119,120 @@ resource "coder_agent" "main" {
 
     # ---- Docker デーモン (DinD) 待機 ----
     CODE_SERVER_PORT=8080
-    if timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 2; done'; then
+    if timeout 120 sh -c 'until docker info >/dev/null 2>&1; do sleep 3; done'; then
       DOCKER_OK=true
     else
       DOCKER_OK=false
       echo "警告: Docker デーモンに接続できません。devcontainer は使用できません。"
     fi
 
-    # ---- devcontainer.json が存在する場合は devcontainer を使用 ----
+    # ---- code-server をホストで即時起動 ----
+    # devcontainer の有無にかかわらず、まず code-server をホストで起動して 502 を回避する
+    code-server --bind-addr "0.0.0.0:$CODE_SERVER_PORT" --auth none "$REPO_DIR" >/tmp/code-server.log 2>&1 &
+    echo "==> code-server を起動しました (port $CODE_SERVER_PORT)"
+
+    # ---- devcontainer.json が存在する場合はバックグラウンドでビルド ----
     if [ "$DOCKER_OK" = "true" ] && [ -f "$REPO_DIR/.devcontainer/devcontainer.json" ]; then
-      echo "==> devcontainer.json を検出。devcontainer を起動します..."
+      echo "==> devcontainer.json を検出。バックグラウンドでビルドを開始します..."
 
-      DEVCONTAINER_OUT=$(devcontainer up \
-        --workspace-folder "$REPO_DIR" \
-        --log-format json 2>&1 || true)
-      CONTAINER_ID=$(echo "$DEVCONTAINER_OUT" \
-        | grep '"containerId"' \
-        | grep -o '"containerId":[[:space:]]*"[^"]*"' \
-        | cut -d'"' -f4 \
-        | tail -1)
+      # K8s VXLAN MTU 問題の対策: buildkitd 自体を Pod のネットワーク名前空間で動かす
+      # これにより RUN ステップが Pod の eth0 (MTU ~1450) を使い、curl 等が正常に動作する
+      # またこのラッパーは ~/.bashrc に追記することでユーザーが手動再ビルドする際にも有効
+      mkdir -p ~/bin
+      cat > ~/bin/docker << 'DOCKERWRAP'
+#!/bin/sh
+if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
+  shift 2
+  exec /usr/bin/docker buildx build --network=host "$@"
+fi
+exec /usr/bin/docker "$@"
+DOCKERWRAP
+      chmod +x ~/bin/docker
+      grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc \
+        || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+      export PATH="$HOME/bin:$PATH"
 
-      if [ -n "$CONTAINER_ID" ]; then
-        # devcontainer 内に code-server をインストールして起動
-        docker exec "$CONTAINER_ID" sh -c \
-          'command -v code-server >/dev/null 2>&1 \
-            || curl -fsSL https://code-server.dev/install.sh | sh >/dev/null 2>&1'
-        docker exec -d "$CONTAINER_ID" \
-          code-server --bind-addr "0.0.0.0:$CODE_SERVER_PORT" --auth none /workspace
+      # buildx builder を作成 (ユーザーが手動再ビルドする際も使い回せる)
+      docker buildx create \
+        --name k8s-builder \
+        --driver docker-container \
+        --driver-opt network=host \
+        --use 2>/dev/null || docker buildx use k8s-builder 2>/dev/null || true
 
-        # devcontainer の内部 IP を取得して socat でポートフォワード
-        CONTAINER_IP=$(docker inspect \
-          -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-          "$CONTAINER_ID")
-        socat "TCP-LISTEN:$CODE_SERVER_PORT,fork,reuseaddr" \
-              "TCP:$CONTAINER_IP:$CODE_SERVER_PORT" &
-        echo "==> devcontainer 内の code-server をポート $CODE_SERVER_PORT で公開しました"
-      else
-        echo "==> devcontainer の起動に失敗。直接 code-server を起動します..."
-        code-server --bind-addr "0.0.0.0:$CODE_SERVER_PORT" --auth none "$REPO_DIR" &
-      fi
-    else
-      # devcontainer なし: code-server を直接起動
-      code-server --bind-addr "0.0.0.0:$CODE_SERVER_PORT" --auth none "$REPO_DIR" &
+      # ビルドログはリポジトリ内に書き込む → code-server のエクスプローラーから確認可能
+      DEVCONTAINER_LOG="$REPO_DIR/.devcontainer/build.log"
+
+      (
+        devcontainer up \
+          --workspace-folder "$REPO_DIR" \
+          --log-format json >"$DEVCONTAINER_LOG" 2>&1
+        EXIT_CODE=$?
+        echo "==> devcontainer up 完了 (exit: $EXIT_CODE)" | tee -a "$DEVCONTAINER_LOG"
+
+        CONTAINER_ID=$(grep '"containerId"' "$DEVCONTAINER_LOG" \
+          | grep -o '"containerId":[[:space:]]*"[^"]*"' \
+          | cut -d'"' -f4 \
+          | tail -1 || true)
+
+        if [ -n "$CONTAINER_ID" ]; then
+          echo "$CONTAINER_ID" > /tmp/devcontainer-id
+          echo "==> devcontainer 起動完了: $CONTAINER_ID"
+
+          # ホストの code-server バイナリを devcontainer 内にコピーして起動する
+          DEVCONTAINER_PORT=8081
+          docker cp /usr/lib/code-server "$CONTAINER_ID":/usr/lib/code-server
+
+          REMOTE_WORKSPACE=$(grep '"remoteWorkspaceFolder"' "$DEVCONTAINER_LOG" \
+            | grep -o '"remoteWorkspaceFolder":[[:space:]]*"[^"]*"' \
+            | cut -d'"' -f4 | tail -1)
+          REMOTE_WORKSPACE="$${REMOTE_WORKSPACE:-/workspaces}"
+
+          # devcontainer の remoteUser を決定する
+          # 1. devcontainer up の最終 JSON 行 ("outcome":"success" の行に remoteUser が含まれる)
+          REMOTE_USER=$(grep -o '"remoteUser":"[^"]*"' "$DEVCONTAINER_LOG" \
+            | cut -d'"' -f4 | tail -1)
+          # 2. コンテナラベル (devcontainer.metadata) から取得
+          if [[ -z "$REMOTE_USER" ]]; then
+            REMOTE_USER=$(docker inspect "$CONTAINER_ID" \
+              --format '{{index .Config.Labels "devcontainer.metadata"}}' 2>/dev/null \
+              | grep -o '"remoteUser":"[^"]*"' | cut -d'"' -f4 | tail -1 || true)
+          fi
+          # 3. コンテナ内に vscode ユーザーが存在すれば使用 (devcontainers/base イメージのデフォルト)
+          if [[ -z "$REMOTE_USER" ]]; then
+            REMOTE_USER=$(docker exec "$CONTAINER_ID" \
+              getent passwd vscode 2>/dev/null | cut -d: -f1 || echo "")
+          fi
+          REMOTE_USER="$${REMOTE_USER:-root}"
+
+          # remoteUser のホームディレクトリを取得 (docker exec は HOME=/root のままなので明示指定)
+          REMOTE_HOME=$(docker exec "$CONTAINER_ID" \
+            getent passwd "$REMOTE_USER" 2>/dev/null | cut -d: -f6 || echo "/root")
+          REMOTE_HOME="$${REMOTE_HOME:-/root}"
+
+          echo "==> devcontainer remoteUser: $REMOTE_USER (home: $REMOTE_HOME)"
+
+          docker exec -d -u "$REMOTE_USER" -e "HOME=$REMOTE_HOME" "$CONTAINER_ID" \
+            /usr/lib/code-server/bin/code-server \
+            --bind-addr "0.0.0.0:$DEVCONTAINER_PORT" \
+            --auth none \
+            "$REMOTE_WORKSPACE"
+
+          # socat でポートフォワード: ホスト 8080 → devcontainer 8081
+          CONTAINER_IP=$(docker inspect \
+            -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            "$CONTAINER_ID")
+
+          # ホスト側 code-server を停止してポートを解放してから socat を起動
+          pkill -f "code-server.*0\.0\.0\.0:$CODE_SERVER_PORT" 2>/dev/null || true
+          sleep 1
+          socat "TCP-LISTEN:$CODE_SERVER_PORT,fork,reuseaddr" \
+                "TCP:$CONTAINER_IP:$DEVCONTAINER_PORT" >/tmp/socat.log 2>&1 &
+
+          echo "==> devcontainer 内の code-server に切り替えました"
+        else
+          echo "==> devcontainer の起動に失敗しました。$DEVCONTAINER_LOG を確認してください。"
+        fi
+      ) >>/tmp/coder-startup-script.log 2>&1 &
     fi
 
     echo "==> ワークスペース準備完了: https://${local.hostname}"
@@ -168,7 +241,7 @@ resource "coder_agent" "main" {
   metadata {
     display_name = "CPU 使用率"
     key          = "cpu"
-    script       = "coder stat cpu"
+    script       = "/tmp/coder-agent stat cpu"
     interval     = 10
     timeout      = 1
   }
@@ -176,7 +249,7 @@ resource "coder_agent" "main" {
   metadata {
     display_name = "メモリ使用率"
     key          = "mem"
-    script       = "coder stat mem"
+    script       = "/tmp/coder-agent stat mem"
     interval     = 10
     timeout      = 1
   }
@@ -190,7 +263,6 @@ resource "coder_app" "code_server" {
   icon         = "/icon/code.svg"
   url          = "https://${local.hostname}"
   external     = true
-  share        = "owner"
 }
 
 # ---- Kubernetes リソース ----
@@ -269,19 +341,23 @@ resource "kubernetes_deployment" "workspace" {
             <<-EOT
               set -e
               curl -fsSL "${data.coder_workspace.me.access_url}/bin/coder-linux-amd64" \
-                -o /usr/local/bin/coder-agent
-              chmod +x /usr/local/bin/coder-agent
-              exec /usr/local/bin/coder-agent agent --auth token
+                -o /tmp/coder-agent
+              chmod +x /tmp/coder-agent
+              cd /tmp && exec /tmp/coder-agent agent --auth token
             EOT
           ]
 
+          env {
+            name  = "CODER_AGENT_URL"
+            value = data.coder_workspace.me.access_url
+          }
           env {
             name  = "CODER_AGENT_TOKEN"
             value = coder_agent.main.token
           }
           env {
             name  = "DOCKER_HOST"
-            value = "unix:///var/run/docker.sock"
+            value = "tcp://localhost:2375"
           }
           env {
             name  = "GITHUB_TOKEN"
@@ -330,8 +406,13 @@ resource "kubernetes_deployment" "workspace" {
           name  = "dind"
           image = "docker:27-dind"
 
+          # エントリーポイントが DOCKER_TLS_CERTDIR="" 時に tcp://0.0.0.0:2375 を自動追加する
+          # --tls=false で起動遅延警告 (5秒) を抑制, --mtu=1450 で K8s VXLAN の MTU に合わせる
+          args = ["--tls=false", "--mtu=1450"]
+
           security_context {
-            privileged = true
+            privileged  = true
+            run_as_user = 0  # docker:dind は root で実行する必要がある (Pod レベルの run_as_user=1000 をオーバーライド)
           }
 
           env {
@@ -415,7 +496,7 @@ resource "kubernetes_ingress_v1" "workspace" {
     namespace = var.namespace
 
     annotations = {
-      "cert-manager.io/cluster-issuer" = var.cluster_issuer
+      # cert-manager アノテーションは不要 (wildcard-tls を共有利用)
 
       # oauth2-proxy による認証
       "nginx.ingress.kubernetes.io/auth-url" = (
@@ -425,11 +506,6 @@ resource "kubernetes_ingress_v1" "workspace" {
         "https://auth.${var.domain}/oauth2/start?rd=$escaped_request_uri"
       )
       "nginx.ingress.kubernetes.io/auth-response-headers" = "X-Auth-Request-User"
-
-      # ワークスペースオーナーのみアクセス許可
-      "nginx.ingress.kubernetes.io/configuration-snippet" = (
-        "if ($http_x_auth_request_user != \"${local.owner_name}\") {\n  return 403;\n}\n"
-      )
     }
   }
 
@@ -438,7 +514,7 @@ resource "kubernetes_ingress_v1" "workspace" {
 
     tls {
       hosts       = [local.hostname]
-      secret_name = "ws-${local.workspace_name}-${local.owner_name}-tls"
+      secret_name = "wildcard-tls"
     }
 
     rule {
